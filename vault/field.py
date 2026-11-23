@@ -16,6 +16,62 @@ AAD 一律拒绝。
 密钥材料全部显式传入。
 """
 
+import base64
+import hashlib
+import hmac
+import json
+
+VERSION = 2
+_TOKEN_KEYS = frozenset(("v", "c", "t", "h"))
+
+_DOMAIN_TENANT_KEY = b"vault-field-tenant-key-v1"
+_DOMAIN_ENCRYPTION = b"vault-field-encryption-v1"
+_DOMAIN_AUTHENTICATION = b"vault-field-authentication-v1"
+_DOMAIN_INDEX = b"vault-field-blind-index-v1"
+_DOMAIN_TAG = b"vault-field-tag-v1"
+_DOMAIN_STRUCTURE = b"vault-field-structure-hash-v1"
+
+
+def _require_bytes(value, name):
+    if not isinstance(value, bytes) or not value:
+        raise ValueError(f"{name} 必须是非空 bytes")
+
+
+def _require_nonempty_str(value, name):
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} 必须是非空字符串")
+
+
+def _frame(*parts: bytes) -> bytes:
+    """用 ``长度:内容`` 分帧拼接字节，杜绝分隔符歧义。"""
+    framed = []
+    for part in parts:
+        framed.append(str(len(part)).encode("ascii"))
+        framed.append(b":")
+        framed.append(part)
+    return b"".join(framed)
+
+
+def _keystream(seed: bytes, length: int) -> bytes:
+    """HMAC-SHA256 计数器模式生成确定性密钥流，不使用任何随机数。"""
+    blocks = []
+    produced = 0
+    counter = 1
+    while produced < length:
+        block = hmac.new(
+            seed,
+            b"counter:" + str(counter).encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        blocks.append(block)
+        produced += len(block)
+        counter += 1
+    return b"".join(blocks)[:length]
+
+
+def _xor(data: bytes, stream: bytes) -> bytes:
+    return bytes(left ^ right for left, right in zip(data, stream))
+
 
 def derive_key(master: bytes, tenant: str) -> bytes:
     """按租户派生数据密钥。
@@ -26,7 +82,33 @@ def derive_key(master: bytes, tenant: str) -> bytes:
     - 使用 HMAC-SHA256 做域分离，返回 32 字节；相同输入必须得到相同结果。
     - 不同租户必须得到不同密钥，禁止把 master 直接当作所有租户共享的密钥。
     """
-    raise NotImplementedError
+    _require_bytes(master, "master")
+    _require_nonempty_str(tenant, "tenant")
+    return hmac.new(
+        master,
+        _DOMAIN_TENANT_KEY + tenant.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+
+def _split_keys(key: bytes) -> tuple[bytes, bytes]:
+    """从字段密钥派生出相互独立的加密密钥与认证密钥。"""
+    encryption_key = hmac.new(key, _DOMAIN_ENCRYPTION, hashlib.sha256).digest()
+    authentication_key = hmac.new(key, _DOMAIN_AUTHENTICATION, hashlib.sha256).digest()
+    return encryption_key, authentication_key
+
+
+def _structure_hash(aad_bytes: bytes, ciphertext: bytes, tag: bytes) -> bytes:
+    """无密钥结构校验值，覆盖版本、AAD、密文与标签。"""
+    return hashlib.sha256(
+        _frame(
+            _DOMAIN_STRUCTURE,
+            str(VERSION).encode("ascii"),
+            aad_bytes,
+            ciphertext,
+            tag,
+        )
+    ).digest()
 
 
 def encrypt_field(key: bytes, plaintext: str, aad: str) -> str:
@@ -43,7 +125,60 @@ def encrypt_field(key: bytes, plaintext: str, aad: str) -> str:
     - 加密确定性：同一 key、plaintext、aad 必须得到完全相同的令牌，不使用
       随机数或当前时间。
     """
-    raise NotImplementedError
+    _require_bytes(key, "key")
+    if not isinstance(plaintext, str):
+        raise ValueError("plaintext 必须是字符串")
+    _require_nonempty_str(aad, "aad")
+
+    aad_bytes = aad.encode("utf-8")
+    plaintext_bytes = plaintext.encode("utf-8")
+    encryption_key, authentication_key = _split_keys(key)
+
+    ciphertext = _xor(
+        plaintext_bytes,
+        _keystream(encryption_key, len(plaintext_bytes)),
+    )
+    # AAD 以分帧方式进入 HMAC，真正参与认证；令牌中不保存明文 AAD。
+    tag = hmac.new(
+        authentication_key,
+        _frame(_DOMAIN_TAG, aad_bytes, ciphertext),
+        hashlib.sha256,
+    ).digest()
+    structure_hash = _structure_hash(aad_bytes, ciphertext, tag)
+
+    payload = {
+        "v": VERSION,
+        "c": base64.urlsafe_b64encode(ciphertext).decode("ascii"),
+        "t": base64.urlsafe_b64encode(tag).decode("ascii"),
+        "h": base64.urlsafe_b64encode(structure_hash).decode("ascii"),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _parse_token(token: str):
+    """解析令牌并返回 (版本, 密文, 标签, 结构校验值)，畸形一律抛 ValueError。"""
+    if not isinstance(token, str):
+        raise ValueError("令牌必须是字符串")
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("令牌无法解析或 base64 非法") from exc
+
+    if not isinstance(payload, dict) or frozenset(payload.keys()) != _TOKEN_KEYS:
+        raise ValueError("令牌字段缺失或包含非法字段")
+    if not all(isinstance(payload[name], str) for name in ("c", "t", "h")):
+        raise ValueError("令牌字段类型非法")
+
+    try:
+        ciphertext = base64.urlsafe_b64decode(payload["c"].encode("ascii"))
+        tag = base64.urlsafe_b64decode(payload["t"].encode("ascii"))
+        structure_hash = base64.urlsafe_b64decode(payload["h"].encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("令牌中的 base64 数据非法") from exc
+
+    return payload["v"], ciphertext, tag, structure_hash
 
 
 def decrypt_field(key: bytes, token: str, aad: str) -> str:
@@ -56,7 +191,39 @@ def decrypt_field(key: bytes, token: str, aad: str) -> str:
     - 版本 1 或其他旧版本不得回退兼容，AAD 不得忽略，所有比较容差为 0。
     - 任一校验失败抛 ValueError，绝不返回未经认证的明文。
     """
-    raise NotImplementedError
+    _require_bytes(key, "key")
+    version, ciphertext, tag, structure_hash = _parse_token(token)
+
+    # 1. 版本必须精确等于 2，bool 不冒充整数，旧版本不做回退兼容。
+    if not isinstance(version, int) or isinstance(version, bool) or version != VERSION:
+        raise ValueError(f"不支持的令牌版本，当前仅支持版本 {VERSION}")
+
+    # 2. AAD 必须非空；是否与加密时一致由后续 h、t 逐字节校验。
+    _require_nonempty_str(aad, "aad")
+    aad_bytes = aad.encode("utf-8")
+
+    # 3. 无密钥结构校验：覆盖 v、AAD、c、t，同长度单字节改动也会失配。
+    expected_structure = _structure_hash(aad_bytes, ciphertext, tag)
+    if not hmac.compare_digest(expected_structure, structure_hash):
+        raise ValueError("结构校验值不匹配，令牌可能已被篡改或附加数据不一致")
+
+    # 4. 带密钥的 HMAC 认证标签，AAD 与密文均在认证范围内。
+    _, authentication_key = _split_keys(key)
+    expected_tag = hmac.new(
+        authentication_key,
+        _frame(_DOMAIN_TAG, aad_bytes, ciphertext),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(expected_tag, tag):
+        raise ValueError("认证标签校验失败")
+
+    # 5. 全部校验通过后才解密；UTF-8 失败同样拒绝，绝不返回未经认证的明文。
+    encryption_key, _ = _split_keys(key)
+    plaintext_bytes = _xor(ciphertext, _keystream(encryption_key, len(ciphertext)))
+    try:
+        return plaintext_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("解密结果不是合法 UTF-8 明文") from exc
 
 
 def blind_index(key: bytes, value: str) -> str:
@@ -69,7 +236,13 @@ def blind_index(key: bytes, value: str) -> str:
       得到不同索引。
     - 结果不得等于 sha256(value) 的十六进制值，禁止对明文做无密钥哈希。
     """
-    raise NotImplementedError
+    _require_bytes(key, "key")
+    _require_nonempty_str(value, "value")
+    return hmac.new(
+        key,
+        _DOMAIN_INDEX + value.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def rotate_token(old_key: bytes, new_key: bytes, token: str, aad: str) -> str:
@@ -81,7 +254,12 @@ def rotate_token(old_key: bytes, new_key: bytes, token: str, aad: str) -> str:
       旧令牌损坏或 AAD 不符时直接抛 ValueError，绝不把解出的错误值重新加密。
     - 校验通过后用 new_key 与同一 aad 调用 encrypt_field，版本保持 2。
     """
-    raise NotImplementedError
+    _require_bytes(old_key, "old_key")
+    _require_bytes(new_key, "new_key")
+    _require_nonempty_str(aad, "aad")
+    # 完整走一遍解密校验，任何一环失败都直接抛出，不会产生重加密结果。
+    plaintext = decrypt_field(old_key, token, aad)
+    return encrypt_field(new_key, plaintext, aad)
 
 
 def detect_tamper(token: str, aad: str) -> bool:
@@ -94,7 +272,16 @@ def detect_tamper(token: str, aad: str) -> bool:
     - 必须实际比较内容，不能只比较总长度；同长度单字节改动必须返回 True。
     - 本函数只做无密钥结构检测，强完整性仍由 decrypt_field 的标签 t 保证。
     """
-    raise NotImplementedError
+    try:
+        version, ciphertext, tag, structure_hash = _parse_token(token)
+        if not isinstance(version, int) or isinstance(version, bool) or version != VERSION:
+            return True
+        if not isinstance(aad, str) or not aad:
+            return True
+        expected = _structure_hash(aad.encode("utf-8"), ciphertext, tag)
+        return not hmac.compare_digest(expected, structure_hash)
+    except Exception:
+        return True
 
 
 def validate_policy(policy) -> list[str]:
@@ -109,7 +296,20 @@ def validate_policy(policy) -> list[str]:
     每个问题一个字符串，顺序与上述检查顺序一致；不要因为一个问题而跳过
     后续检查。
     """
-    raise NotImplementedError
+    settings = policy if isinstance(policy, dict) else {}
+    issues = []
+
+    aad = settings.get("aad")
+    if not isinstance(aad, str) or not aad.strip():
+        issues.append("附加数据为空：策略必须提供非空 AAD 以绑定记录归属")
+
+    if settings.get("key_scope") != "tenant":
+        issues.append("密钥全局共享：密钥作用域必须为 tenant，按租户隔离派生")
+
+    if settings.get("index_rotation") is not True:
+        issues.append("未启用索引轮换：index_rotation 必须显式为 True")
+
+    return issues
 
 
 def field_batch(rows, policy) -> dict:
@@ -131,4 +331,28 @@ def field_batch(rows, policy) -> dict:
       indexes 和 rows 等长，失败位置为 None；problems 以失败行下标为键，
       值为错误文本。成功行不写入 problems。
     """
-    raise NotImplementedError
+    issues = validate_policy(policy)
+    if issues:
+        raise ValueError("策略校验失败：" + "；".join(issues))
+
+    tokens = []
+    indexes = []
+    problems = {}
+
+    for position, row in enumerate(rows):
+        try:
+            # 每行独立派生，密钥、AAD、索引键均不从上行继承或复用。
+            key = derive_key(policy["master_key"], row["tenant"])
+            row_aad = policy["aad"] + ":" + row["tenant"] + ":" + row["user"]
+            token = encrypt_field(key, row["phone"], row_aad)
+            index_key = derive_key(key, "blind-index-v1")
+            index = blind_index(index_key, row["phone"])
+        except Exception as exc:
+            tokens.append(None)
+            indexes.append(None)
+            problems[position] = str(exc)
+        else:
+            tokens.append(token)
+            indexes.append(index)
+
+    return {"tokens": tokens, "indexes": indexes, "problems": problems}
